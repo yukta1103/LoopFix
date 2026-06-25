@@ -2,107 +2,181 @@ import subprocess
 import tempfile
 import os
 import re
-from typing import TypedDict, Annotated
+import json
+from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_community.llms import Ollama
 
-llm = Ollama(model="deepseek-coder:6.7b", temperature=0.2)
+builder_llm = Ollama(model="deepseek-coder:6.7b", temperature=0.2)
+breaker_llm = Ollama(model="deepseek-coder:6.7b", temperature=0.8)  # higher temp = more creative attacks
 
-MAX_ITERATIONS = 5
+MAX_ROUNDS = 4
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
     problem: str
     code: str
-    execution_output: str
-    error: str
-    passed: bool
-    iterations: int
-    trace: list[dict]  # full reasoning history
+    test_cases: list[dict]       # [{input, expected, explanation}]
+    test_results: list[dict]     # [{input, expected, actual, passed, explanation}]
+    all_passed: bool
+    rounds: int
+    trace: list[dict]            # full debate history
 
-# ─── Nodes ────────────────────────────────────────────────────────────────────
+# ─── Node: Builder ────────────────────────────────────────────────────────────
 
-def write_code(state: AgentState) -> AgentState:
-    """Generate code for the problem (first attempt)."""
-    prompt = f"""You are a Python coding assistant. Return ONLY valid Python code.
-No explanations. No markdown. No prose. Just raw executable Python code.
+def builder_write(state: AgentState) -> AgentState:
+    """Builder writes/rewrites the solution."""
+    is_first = state["rounds"] == 0
+
+    if is_first:
+        prompt = f"""You are an expert Python programmer. Return ONLY valid Python code.
+No explanations. No markdown. No prose. Define a function that solves the problem.
+The function must be named 'solve' and return the answer (do not print).
 
 Problem:
 {state['problem']}
 """
-    code = llm.invoke(prompt).strip()
-    code = _strip_markdown(code)
+    else:
+        failed = [t for t in state["test_results"] if not t["passed"]]
+        failed_summary = "\n".join(
+            f"- Input: {t['input']} | Expected: {t['expected']} | Got: {t['actual']}\n  Why it's tricky: {t['explanation']}"
+            for t in failed
+        )
+        prompt = f"""You are an expert Python programmer. Return ONLY valid Python code.
+No explanations. No markdown. No prose. Fix the function named 'solve'.
 
+Problem:
+{state['problem']}
+
+Current broken code:
+{state['code']}
+
+Failed test cases (with explanations of WHY they're tricky):
+{failed_summary}
+"""
+
+    code = _strip_markdown(builder_llm.invoke(prompt).strip())
     state["code"] = code
-    state["iterations"] = state.get("iterations", 0) + 1
+    state["rounds"] = state["rounds"] + 1
+
     state["trace"].append({
-        "iteration": state["iterations"],
-        "action": "write",
+        "round": state["rounds"],
+        "agent": "builder",
         "code": code,
-        "note": "Initial solution generated."
+        "note": "Initial solution." if is_first else f"Rewrote after {len(failed)} failed test(s)."
     })
     return state
 
 
-def execute_code(state: AgentState) -> AgentState:
-    """Run the code in a subprocess and capture output or error."""
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-        f.write(state["code"])
-        tmp_path = f.name
+# ─── Node: Breaker ────────────────────────────────────────────────────────────
 
-    try:
-        result = subprocess.run(
-            ["python", tmp_path],
-            capture_output=True, text=True, timeout=10
-        )
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-
-        if result.returncode == 0:
-            state["execution_output"] = stdout
-            state["error"] = ""
-            state["passed"] = True
-        else:
-            state["execution_output"] = stdout
-            state["error"] = stderr
-            state["passed"] = False
-    except subprocess.TimeoutExpired:
-        state["error"] = "TimeoutError: code took longer than 10 seconds."
-        state["passed"] = False
-    finally:
-        os.unlink(tmp_path)
-
-    state["trace"][-1]["output"] = state["execution_output"]
-    state["trace"][-1]["error"] = state["error"]
-    state["trace"][-1]["passed"] = state["passed"]
-    return state
-
-
-def debug_code(state: AgentState) -> AgentState:
-    """Rewrite code based on the error."""
-    prompt = f"""You are a Python debugging assistant. Return ONLY valid Python code.
-No explanations. No markdown. No prose. Just raw executable Python code.
+def breaker_attack(state: AgentState) -> AgentState:
+    """Breaker generates adversarial test cases with explanations."""
+    prompt = f"""You are an adversarial tester trying to break Python code.
+Generate 5 tricky test cases for the function 'solve' below.
+Focus on edge cases: empty inputs, negatives, duplicates, large numbers, off-by-one errors, type issues.
 
 Problem:
 {state['problem']}
 
-Broken code:
+Code to attack:
 {state['code']}
 
-Error:
-{state['error']}
+Return ONLY a JSON array, no markdown, no explanation outside JSON:
+[
+  {{
+    "input": <the exact argument(s) to pass to solve(), as a JSON value>,
+    "expected": <the correct expected output as a JSON value>,
+    "explanation": <one sentence: why this test case could break the code>
+  }},
+  ...
+]
 """
-    new_code = llm.invoke(prompt).strip()
-    new_code = _strip_markdown(new_code)
+    raw = breaker_llm.invoke(prompt).strip()
+    test_cases = _parse_json(raw)
 
-    state["code"] = new_code
-    state["iterations"] = state.get("iterations", 0) + 1
+    state["test_cases"] = test_cases
     state["trace"].append({
-        "iteration": state["iterations"],
-        "action": "debug",
-        "code": new_code,
-        "note": f"Fixed after error: {state['error'][:120]}"
+        "round": state["rounds"],
+        "agent": "breaker",
+        "test_cases": test_cases,
+        "note": f"Generated {len(test_cases)} adversarial test cases."
+    })
+    return state
+
+
+# ─── Node: Execute Tests ──────────────────────────────────────────────────────
+
+def execute_tests(state: AgentState) -> AgentState:
+    """Run the solution against all breaker test cases."""
+    results = []
+
+    for tc in state["test_cases"]:
+        inp = tc.get("input")
+        expected = tc.get("expected")
+        explanation = tc.get("explanation", "")
+
+        # Build a test script
+        test_code = f"""
+import json
+{state['code']}
+
+try:
+    inp = json.loads({json.dumps(json.dumps(inp))})
+    if isinstance(inp, list) and len(inp) > 0 and isinstance(inp[0], list):
+        result = solve(*inp)
+    elif isinstance(inp, list):
+        result = solve(inp)
+    else:
+        result = solve(inp)
+    print(json.dumps(result))
+except Exception as e:
+    print(f"ERROR: {{e}}")
+"""
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False, encoding="utf-8") as f:
+            f.write(test_code)
+            tmp_path = f.name
+
+        try:
+            result = subprocess.run(
+                ["python", tmp_path],
+                capture_output=True, text=True, timeout=10
+            )
+            actual_raw = result.stdout.strip()
+            if actual_raw.startswith("ERROR:"):
+                actual = actual_raw
+                passed = False
+            else:
+                try:
+                    actual = json.loads(actual_raw)
+                    passed = actual == expected
+                except:
+                    actual = actual_raw
+                    passed = str(actual).strip() == str(expected).strip()
+        except subprocess.TimeoutExpired:
+            actual = "TimeoutError"
+            passed = False
+        finally:
+            os.unlink(tmp_path)
+
+        results.append({
+            "input": inp,
+            "expected": expected,
+            "actual": actual,
+            "passed": passed,
+            "explanation": explanation
+        })
+
+    state["test_results"] = results
+    state["all_passed"] = all(r["passed"] for r in results)
+
+    state["trace"].append({
+        "round": state["rounds"],
+        "agent": "executor",
+        "results": results,
+        "all_passed": state["all_passed"],
+        "note": f"{sum(r['passed'] for r in results)}/{len(results)} tests passed."
     })
     return state
 
@@ -110,28 +184,28 @@ Error:
 # ─── Routing ──────────────────────────────────────────────────────────────────
 
 def should_continue(state: AgentState) -> str:
-    if state["passed"]:
+    if state["all_passed"]:
         return "end"
-    if state["iterations"] >= MAX_ITERATIONS:
+    if state["rounds"] >= MAX_ROUNDS:
         return "end"
-    return "debug"
+    return "attack"  # breaker attacks again with new test cases
 
 
 # ─── Graph ────────────────────────────────────────────────────────────────────
 
 def build_graph():
     g = StateGraph(AgentState)
-    g.add_node("write_code", write_code)
-    g.add_node("execute_code", execute_code)
-    g.add_node("debug_code", debug_code)
+    g.add_node("builder", builder_write)
+    g.add_node("breaker", breaker_attack)
+    g.add_node("executor", execute_tests)
 
-    g.set_entry_point("write_code")
-    g.add_edge("write_code", "execute_code")
-    g.add_conditional_edges("execute_code", should_continue, {
+    g.set_entry_point("builder")
+    g.add_edge("builder", "breaker")
+    g.add_edge("breaker", "executor")
+    g.add_conditional_edges("executor", should_continue, {
         "end": END,
-        "debug": "debug_code"
+        "attack": "builder"   # builder sees failures, rewrites, breaker attacks again
     })
-    g.add_edge("debug_code", "execute_code")
 
     return g.compile()
 
@@ -141,10 +215,10 @@ def run_agent(problem: str) -> AgentState:
     initial_state: AgentState = {
         "problem": problem,
         "code": "",
-        "execution_output": "",
-        "error": "",
-        "passed": False,
-        "iterations": 0,
+        "test_cases": [],
+        "test_results": [],
+        "all_passed": False,
+        "rounds": 0,
         "trace": []
     }
     return graph.invoke(initial_state)
@@ -153,25 +227,31 @@ def run_agent(problem: str) -> AgentState:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _strip_markdown(text: str) -> str:
-    """Extract only the Python code block, stripping prose and markdown fences."""
-    # If there's a ```python or ``` block, extract just that
     match = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
-
-    # Otherwise strip lines until we hit something that looks like code
     lines = text.strip().splitlines()
     code_lines = []
     code_started = False
-    code_starters = (
-        "def ", "class ", "import ", "from ", "print(",
-        "if ", "for ", "while ", "return ", "#", "    "
-    )
+    code_starters = ("def ", "class ", "import ", "from ", "print(", "if ", "for ", "while ", "return ", "#", "    ")
     for line in lines:
         if not code_started:
             if line.strip().startswith(code_starters) or re.match(r"^[a-zA-Z_]\w*\s*=", line):
                 code_started = True
         if code_started:
             code_lines.append(line)
-
     return "\n".join(code_lines).strip() if code_lines else text.strip()
+
+
+def _parse_json(text: str) -> list:
+    text = re.sub(r"```(?:json)?\n?", "", text).replace("```", "").strip()
+    try:
+        return json.loads(text)
+    except:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except:
+                pass
+    return []

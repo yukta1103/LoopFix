@@ -5,102 +5,88 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent.graph import run_agent
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(page_title="LoopFix", page_icon="⚔️", layout="wide")
 
-st.set_page_config(
-    page_title="AutoDebug Agent",
-    page_icon="🤖",
-    layout="wide"
-)
+st.title("⚔️ LoopFix")
+st.caption("**Builder** writes code. **Breaker** attacks it with adversarial tests + explains why. They debate until the code is bulletproof.")
 
-st.title("🤖 AutoDebug Agent")
-st.caption("Writes code → runs it → reads errors → fixes → repeats. Powered by DeepSeek-Coder + LangGraph.")
+# ─── Samples ──────────────────────────────────────────────────────────────────
 
-# ─── Sample problems ──────────────────────────────────────────────────────────
-
-SAMPLE_PROBLEMS = {
-    "FizzBuzz": "Write a program that prints numbers 1 to 30. For multiples of 3 print 'Fizz', for multiples of 5 print 'Buzz', for multiples of both print 'FizzBuzz'.",
-    "Fibonacci": "Print the first 15 Fibonacci numbers.",
-    "Palindrome Checker": "Write a function is_palindrome(s) that returns True if s is a palindrome. Test it with: 'racecar', 'hello', 'madam'.",
-    "Two Sum": "Given a list [2, 7, 11, 15] and target 9, find two numbers that add up to the target and print their indices.",
-    "Reverse Words": "Write a function that reverses the words in a sentence. Test with: 'Hello World from Python'. Print the result.",
+SAMPLES = {
+    "3Sum": "Write a function solve(nums) that finds all unique triplets in the list that sum to zero. Return a list of triplets (each sorted). E.g. solve([-1,0,1,2,-1,-4]) → [[-1,-1,2],[-1,0,1]]",
+    "Longest Substring": "Write a function solve(s) that returns the length of the longest substring without repeating characters. E.g. solve('abcabcbb') → 3",
+    "Valid Parentheses": "Write a function solve(s) that returns True if the string of brackets is valid (every open bracket has a matching close). E.g. solve('()[]{}') → True, solve('(]') → False",
+    "Merge Intervals": "Write a function solve(intervals) that merges all overlapping intervals. E.g. solve([[1,3],[2,6],[8,10],[15,18]]) → [[1,6],[8,10],[15,18]]",
 }
 
-# ─── Sidebar ──────────────────────────────────────────────────────────────────
-
 with st.sidebar:
-    st.header("⚙️ Settings")
-    st.markdown("**Model:** `deepseek-coder:6.7b` via Ollama")
-    st.markdown("**Max iterations:** 5")
-    st.markdown("**Execution:** subprocess (local)")
+    st.header("⚙️ Config")
+    st.markdown("🧠 **Builder:** deepseek-coder:6.7b")
+    st.markdown("🔴 **Breaker:** deepseek-coder:6.7b (temp=0.8)")
+    st.markdown("🔁 **Max rounds:** 4")
     st.divider()
-    st.header("📋 Sample Problems")
-    selected_sample = st.selectbox("Load a sample:", ["Custom"] + list(SAMPLE_PROBLEMS.keys()))
+    selected = st.selectbox("Load sample problem:", ["Custom"] + list(SAMPLES.keys()))
 
-# ─── Input ────────────────────────────────────────────────────────────────────
+default = SAMPLES.get(selected, "") if selected != "Custom" else ""
+problem = st.text_area("📝 Problem:", value=default, height=120,
+    placeholder="Describe a coding problem. The agent will write a solve() function.")
 
-default_problem = SAMPLE_PROBLEMS.get(selected_sample, "") if selected_sample != "Custom" else ""
-
-problem = st.text_area(
-    "📝 Describe your coding problem:",
-    value=default_problem,
-    height=120,
-    placeholder="e.g. Write a function that checks if a number is prime and test it on 17, 20, 97."
-)
-
-run_btn = st.button("🚀 Run Agent", type="primary", disabled=not problem.strip())
+run_btn = st.button("⚔️ Start Debate", type="primary", disabled=not problem.strip())
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 if run_btn and problem.strip():
     st.divider()
-
-    with st.spinner("🧠 Agent is thinking..."):
+    with st.spinner("⚔️ Agents are debating..."):
         result = run_agent(problem.strip())
 
-    # ── Summary banner
-    if result["passed"]:
-        st.success(f"✅ Solved in **{result['iterations']} iteration(s)**!")
+    # ── Banner
+    if result["all_passed"]:
+        st.success(f"✅ Builder won — all tests passed after **{result['rounds']} round(s)**!")
     else:
-        st.error(f"❌ Could not solve after {result['iterations']} iterations.")
+        passed = sum(r["passed"] for r in result["test_results"])
+        total = len(result["test_results"])
+        st.warning(f"⚠️ Debate ended after {result['rounds']} rounds — {passed}/{total} tests passing.")
 
-    # ── Final code + output
+    # ── Final state
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("💻 Final Code")
         st.code(result["code"], language="python")
     with col2:
-        st.subheader("📤 Output")
-        if result["execution_output"]:
-            st.code(result["execution_output"])
-        if result["error"]:
-            st.error(result["error"])
+        st.subheader("🧪 Final Test Results")
+        for r in result["test_results"]:
+            icon = "✅" if r["passed"] else "❌"
+            with st.expander(f"{icon} Input: `{r['input']}`"):
+                st.markdown(f"**Expected:** `{r['expected']}`")
+                st.markdown(f"**Got:** `{r['actual']}`")
+                st.markdown(f"**Why tricky:** {r['explanation']}")
 
-    # ── Reasoning trace
+    # ── Full debate trace
     st.divider()
-    st.subheader("🔍 Reasoning Trace")
-    st.caption("Every attempt the agent made — what it wrote, what broke, and how it fixed it.")
+    st.subheader("🥊 Full Debate Trace")
 
     for step in result["trace"]:
-        iteration = step["iteration"]
-        action = step["action"]
-        icon = "✏️" if action == "write" else "🔧"
-        label = "Initial Write" if action == "write" else f"Debug Attempt"
+        agent = step["agent"]
+        round_num = step["round"]
 
-        with st.expander(f"{icon} Iteration {iteration} — {label}", expanded=(iteration == 1)):
-            st.markdown(f"**Note:** {step.get('note', '')}")
-            st.code(step.get("code", ""), language="python")
+        if agent == "builder":
+            with st.expander(f"🧠 Round {round_num} — Builder writes", expanded=(round_num == 1)):
+                st.markdown(f"*{step['note']}*")
+                st.code(step["code"], language="python")
 
-            out = step.get("output", "")
-            err = step.get("error", "")
-            passed = step.get("passed", False)
+        elif agent == "breaker":
+            with st.expander(f"🔴 Round {round_num} — Breaker attacks"):
+                st.markdown(f"*{step['note']}*")
+                for i, tc in enumerate(step["test_cases"], 1):
+                    st.markdown(f"**Test {i}:** `solve({tc['input']})` → expected `{tc['expected']}`")
+                    st.caption(f"💡 {tc['explanation']}")
 
-            if passed:
-                st.success("✅ Passed")
-                if out:
-                    st.code(out)
-            else:
-                if out:
-                    st.code(out)
-                if err:
-                    st.error(f"**Error:** {err}")
+        elif agent == "executor":
+            passed_n = sum(r["passed"] for r in step["results"])
+            total_n = len(step["results"])
+            icon = "✅" if step["all_passed"] else "❌"
+            with st.expander(f"{icon} Round {round_num} — Results: {passed_n}/{total_n} passed"):
+                for r in step["results"]:
+                    status = "✅" if r["passed"] else "❌"
+                    st.markdown(f"{status} `solve({r['input']})` → got `{r['actual']}`, expected `{r['expected']}`")
