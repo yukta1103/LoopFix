@@ -25,8 +25,8 @@ class AgentState(TypedDict):
 
 def write_code(state: AgentState) -> AgentState:
     """Generate code for the problem (first attempt)."""
-    prompt = f"""You are an expert Python programmer.
-Solve the following problem. Return ONLY raw Python code, no markdown, no explanation.
+    prompt = f"""You are a Python coding assistant. Return ONLY valid Python code.
+No explanations. No markdown. No prose. Just raw executable Python code.
 
 Problem:
 {state['problem']}
@@ -81,8 +81,8 @@ def execute_code(state: AgentState) -> AgentState:
 
 def debug_code(state: AgentState) -> AgentState:
     """Rewrite code based on the error."""
-    prompt = f"""You are an expert Python debugger.
-The following code failed. Fix it. Return ONLY raw Python code, no markdown, no explanation.
+    prompt = f"""You are a Python debugging assistant. Return ONLY valid Python code.
+No explanations. No markdown. No prose. Just raw executable Python code.
 
 Problem:
 {state['problem']}
@@ -153,7 +153,25 @@ def run_agent(problem: str) -> AgentState:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _strip_markdown(text: str) -> str:
-    """Remove ```python ... ``` or ``` ... ``` fences if present."""
-    text = re.sub(r"^```(?:python)?\n?", "", text.strip())
-    text = re.sub(r"\n?```$", "", text.strip())
-    return text.strip()
+    """Extract only the Python code block, stripping prose and markdown fences."""
+    # If there's a ```python or ``` block, extract just that
+    match = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # Otherwise strip lines until we hit something that looks like code
+    lines = text.strip().splitlines()
+    code_lines = []
+    code_started = False
+    code_starters = (
+        "def ", "class ", "import ", "from ", "print(",
+        "if ", "for ", "while ", "return ", "#", "    "
+    )
+    for line in lines:
+        if not code_started:
+            if line.strip().startswith(code_starters) or re.match(r"^[a-zA-Z_]\w*\s*=", line):
+                code_started = True
+        if code_started:
+            code_lines.append(line)
+
+    return "\n".join(code_lines).strip() if code_lines else text.strip()
